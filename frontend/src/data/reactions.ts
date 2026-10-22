@@ -1,25 +1,31 @@
-import { computed, reactive, unref, toValue } from 'vue'
-import type { MaybeRefOrGetter } from 'vue'
-import { useCall } from 'frappe-ui'
+import { computed, inject, provide, reactive, shallowReactive, unref, toValue } from 'vue'
+import type { InjectionKey, MaybeRefOrGetter } from 'vue'
+import type { GPReaction } from '@/types/doctypes'
+import { toast, useCall } from 'frappe-ui'
 import { currentQuickReactionEmojis } from './reactionPreferences'
 import { session } from './session'
 import { useUser } from './users'
 
-interface Reaction {
-  name: string
-  emoji: string
-  user: string
+type Reaction = Pick<GPReaction, 'name' | 'emoji' | 'user'>
+
+export type ReactableDoctype = 'GP Discussion' | 'GP Comment' | 'GP Poll'
+type ThreadDoctype = 'GP Discussion' | 'GP Task'
+
+/** A row as thread_reactions and react() return it. */
+interface StoredReaction extends Reaction, Pick<GPReaction, 'reference_name'> {
+  reference_doctype: ReactableDoctype
 }
 
-interface ReactionCount {
+interface ThreadReactions {
+  of: (doctype: ReactableDoctype, name: string | number) => Reaction[]
+  /** Replace a post's reactions with the ones a react() response confirmed. */
+  confirm: (doctype: ReactableDoctype, name: string | number, reactions: Reaction[]) => void
+}
+
+export interface ReactionCount {
   count: number
   users: string[]
   userReacted: boolean
-}
-
-interface PendingReaction {
-  initial: boolean
-  desired: boolean
 }
 
 type ReactionOperation = {
@@ -28,140 +34,167 @@ type ReactionOperation = {
 }
 
 interface UseReactionsOptions {
-  reactions: MaybeRefOrGetter<Reaction[]>
-  doctype: MaybeRefOrGetter<string>
+  doctype: MaybeRefOrGetter<ReactableDoctype>
   name: MaybeRefOrGetter<string | number>
   readOnlyMode?: MaybeRefOrGetter<boolean>
-  onUpdate: (reactions: Reaction[]) => void
+}
+
+const BATCH_DELAY = 1000
+
+const threadReactionsKey: InjectionKey<ThreadReactions> = Symbol('thread-reactions')
+const NO_REACTIONS: Reaction[] = []
+
+const toReaction = ({ name, emoji, user }: Reaction): Reaction => ({ name, emoji, user })
+
+/**
+ * Load the reactions on a thread's root post and on every comment and poll in it, in
+ * one request, for the reaction bars rendered inside the thread. The thread holds each
+ * post's reactions as the server last confirmed them, so a bar that mounts again (a
+ * comment leaving edit mode) shows the same state as before.
+ */
+export function provideThreadReactions(doctype: ThreadDoctype, name: string) {
+  // Fetched once per mount: the url is fixed, and DiscussionView and TaskDetail are
+  // keyed by the thread's id, so another thread mounts a new provider.
+  const thread = useCall<StoredReaction[]>({
+    url: `/api/v2/document/${doctype}/${name}/method/thread_reactions`,
+    cacheKey: ['Thread Reactions', doctype, name],
+  })
+
+  const snapshot = computed(() => {
+    const byPost = new Map<string, Reaction[]>()
+    for (const row of thread.data ?? []) {
+      const key = postKey(row.reference_doctype, row.reference_name)
+      byPost.set(key, [...(byPost.get(key) ?? []), toReaction(row)])
+    }
+    return byPost
+  })
+  // A react() response is newer than the thread request, which went out at mount, so
+  // a post's confirmed reactions win over the snapshot even when the snapshot (or its
+  // cached copy) arrives later.
+  const confirmed = shallowReactive(new Map<string, Reaction[]>())
+
+  provide(threadReactionsKey, {
+    of: (doctype, name) => {
+      const key = postKey(doctype, name)
+      return confirmed.get(key) ?? snapshot.value.get(key) ?? NO_REACTIONS
+    },
+    confirm: (doctype, name, reactions) => confirmed.set(postKey(doctype, name), reactions),
+  })
+}
+
+function postKey(doctype: ReactableDoctype, name: string | number) {
+  return `${doctype}:${name}`
 }
 
 export function useReactions(options: UseReactionsOptions) {
-  const pendingReactions = reactive<Record<string, PendingReaction>>({})
   const currentUser = computed(() => unref(session.user) || '')
 
-  const reactionsList = computed(() => toValue(options.reactions))
   const doctype = computed(() => toValue(options.doctype))
   const name = computed(() => toValue(options.name))
   const readOnlyMode = computed(() => toValue(options.readOnlyMode ?? false))
 
-  const clearPending = () => {
-    for (let key of Object.keys(pendingReactions)) {
-      delete pendingReactions[key]
-    }
+  const thread = inject(threadReactionsKey, null)
+  if (!thread) {
+    throw new Error('Reactions must render inside a thread that calls provideThreadReactions')
   }
+  // What the reactions look like on the server, as the thread last heard.
+  const serverReactions = computed(() => thread.of(doctype.value, name.value))
 
-  const react = useCall<Reaction[], { operations: ReactionOperation[] }>({
+  // Taps the server has not confirmed yet, as emoji -> whether the user wants to
+  // have reacted with it. `queued` waits for the next batch; `sending` is the batch
+  // in flight. Only one batch is in flight at a time, because a second submit on
+  // the same call would abort the first.
+  const queued = reactive(new Map<string, boolean>())
+  const sending = reactive(new Map<string, boolean>())
+
+  const hasReacted = (emoji: string) =>
+    serverReactions.value.some(
+      (reaction) => reaction.user === currentUser.value && reaction.emoji === emoji,
+    )
+  // The user's reaction once the batch in flight lands.
+  const settledState = (emoji: string) => sending.get(emoji) ?? hasReacted(emoji)
+  const displayedState = (emoji: string) => queued.get(emoji) ?? settledState(emoji)
+
+  const react = useCall<StoredReaction[], { operations: ReactionOperation[] }>({
     url: computed(() => `/api/v2/document/${doctype.value}/${name.value}/method/react`),
     method: 'POST',
     immediate: false,
     onSuccess(reactions) {
       if (Array.isArray(reactions)) {
-        options.onUpdate(
-          reactions.map((d) => ({
-            name: d.name,
-            emoji: d.emoji,
-            user: d.user,
-          })),
-        )
+        thread.confirm(doctype.value, name.value, reactions.map(toReaction))
       }
-      clearPending()
+      settle()
+    },
+    onError() {
+      // Dropping the batch is the rollback: those emojis fall back to server state.
+      toast.error('Could not save your reaction')
+      settle()
     },
   })
 
-  const buildPendingOperations = () =>
-    Object.entries(pendingReactions).flatMap(([emoji, pending]) => {
-      if (pending.initial === pending.desired) {
-        return []
-      }
-      return [
-        {
-          emoji,
-          operation: pending.desired ? 'add' : 'remove',
-        } as ReactionOperation,
-      ]
-    })
-
   let submitTimeout: number | null = null
 
-  const submitBatch = () => {
-    cancelSubmit()
-
-    submitTimeout = window.setTimeout(() => {
-      const operations = buildPendingOperations()
-      if (!operations.length) {
-        return
-      }
-      react.submit({ operations })
-    }, 1000)
-  }
-
-  const cancelSubmit = () => {
-    if (submitTimeout) {
-      window.clearTimeout(submitTimeout)
-      submitTimeout = null
+  const send = () => {
+    submitTimeout = null
+    // A batch is in flight: settle() sends these once it lands.
+    if (sending.size || !queued.size) return
+    for (const [emoji, wanted] of queued) {
+      sending.set(emoji, wanted)
     }
-  }
-
-  const setPendingReaction = (emoji: string, initial: boolean, desired: boolean) => {
-    if (initial === desired) {
-      delete pendingReactions[emoji]
-      if (!buildPendingOperations().length) {
-        cancelSubmit()
-      }
-      return
-    }
-    pendingReactions[emoji] = { initial, desired }
-  }
-
-  const getUserReaction = (emoji: string) => {
-    return reactionsList.value.find(
-      (reaction) => reaction.user === currentUser.value && reaction.emoji === emoji,
+    queued.clear()
+    const operations = [...sending].map(
+      ([emoji, wanted]): ReactionOperation => ({ emoji, operation: wanted ? 'add' : 'remove' }),
     )
+    react.submit({ operations }).catch(() => {})
   }
 
-  const addReaction = (emoji: string) => {
-    const reactions = reactionsList.value
-    const reaction = {
-      emoji,
-      user: currentUser.value,
-      name: `new-emoji-${reactions.length}`,
-    }
-    options.onUpdate([...reactions, reaction])
+  const settle = () => {
+    sending.clear()
+    // Taps made while the batch was in flight go out now, unless more taps are
+    // still being collected.
+    if (!submitTimeout) send()
   }
 
-  const removeReaction = (reaction: Reaction) =>
-    options.onUpdate(reactionsList.value.filter((item) => item !== reaction))
+  const scheduleSend = () => {
+    if (submitTimeout) window.clearTimeout(submitTimeout)
+    submitTimeout = queued.size ? window.setTimeout(send, BATCH_DELAY) : null
+  }
 
   const toggleReaction = (emoji: string) => {
     if (readOnlyMode.value) return
-    const existingReaction = getUserReaction(emoji)
-    const pending = pendingReactions[emoji]
-    const currentState = pending ? pending.desired : !!existingReaction
-    const initialState = pending ? pending.initial : !!existingReaction
-    const desiredState = !currentState
-
-    setPendingReaction(emoji, initialState, desiredState)
-
-    if (desiredState) {
-      if (!existingReaction) {
-        addReaction(emoji)
-      }
-    } else if (existingReaction) {
-      removeReaction(existingReaction)
+    const wanted = !displayedState(emoji)
+    // Toggling back before the batch goes out cancels the tap instead of sending it.
+    if (wanted === settledState(emoji)) {
+      queued.delete(emoji)
+    } else {
+      queued.set(emoji, wanted)
     }
-
-    submitBatch()
+    scheduleSend()
   }
 
   const reactionsCount = computed(() => {
+    const me = currentUser.value
+    const pending = new Map([...sending, ...queued])
+    const reactions: Pick<Reaction, 'emoji' | 'user'>[] = serverReactions.value.filter(
+      (reaction) => reaction.user !== me || pending.get(reaction.emoji) !== false,
+    )
+    for (const [emoji, wanted] of pending) {
+      if (
+        wanted &&
+        !reactions.some((reaction) => reaction.user === me && reaction.emoji === emoji)
+      ) {
+        reactions.push({ emoji, user: me })
+      }
+    }
+
     const out: Record<string, ReactionCount> = {}
-    for (let reaction of reactionsList.value) {
+    for (let reaction of reactions) {
       if (!out[reaction.emoji]) {
         out[reaction.emoji] = { count: 0, users: [], userReacted: false }
       }
       out[reaction.emoji].count++
       out[reaction.emoji].users.push(reaction.user)
-      if (reaction.user === currentUser.value) {
+      if (reaction.user === me) {
         out[reaction.emoji].userReacted = true
       }
     }
@@ -174,26 +207,10 @@ export function useReactions(options: UseReactionsOptions) {
       .filter(Boolean)
       .join(', ')
 
-  const batchRequestErrors = computed(() => {
-    const error = react.error
-    // A rapid second reaction makes useFetch abort the still-in-flight first
-    // request (it calls abort() at the start of every execute). That surfaces a
-    // DOMException "signal is aborted without reason". The cancelled operations
-    // aren't lost — they stay in pendingReactions (cleared only on success) and
-    // are resent in the next batch — so an abort isn't a real failure to report.
-    if (!error || error.name === 'AbortError') {
-      return []
-    }
-    const message = error.message || 'Unable to update reactions'
-    return [message]
-  })
-
   return {
     reactionsCount,
     toggleReaction,
     toolTipText,
     standardEmojis: currentQuickReactionEmojis,
-    batchRequestErrors,
-    isLoading: react.loading,
   }
 }

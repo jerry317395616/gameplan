@@ -54,13 +54,14 @@
         </div>
       </div>
       <Dropdown
-        v-show="!isEditing"
+        v-if="!isEditing && !isUpdating"
         class="ml-auto print:hidden"
         align="end"
         :button="{
           icon: 'lucide-more-horizontal',
           variant: 'ghost',
           label: 'Comment Options',
+          disabled: isUpdating,
         }"
         :options="dropdownOptions"
       />
@@ -93,13 +94,9 @@
           }"
         />
         <span class="text-base italic text-ink-gray-5" v-else> This message is deleted </span>
-        <div class="mt-3" v-if="!comment.deleted_at && !isEditing && comment.reactions">
-          <Reactions
-            doctype="GP Comment"
-            :name="comment.name"
-            v-model:reactions="comment.reactions"
-            :read-only-mode="readOnlyMode"
-          />
+        <ErrorMessage v-if="isEditing" class="mt-2" :message="updateError" />
+        <div class="mt-3" v-if="!comment.deleted_at && !isEditing">
+          <Reactions doctype="GP Comment" :name="comment.name" :read-only-mode="readOnlyMode" />
         </div>
       </div>
     </div>
@@ -114,8 +111,8 @@
 
 <script setup lang="ts">
 import { ref, computed, defineAsyncComponent } from 'vue'
-import { Dropdown, Tooltip, dayjsLocal } from 'frappe-ui'
-import { useList } from 'frappe-ui'
+import { Dropdown, ErrorMessage, Tooltip, dayjsLocal } from 'frappe-ui'
+import { useDoctype, useList } from 'frappe-ui'
 import { copyToClipboard } from '@/utils'
 import UserProfileLink from './UserProfileLink.vue'
 import CommentEditor from './editor/CommentEditor.vue'
@@ -123,19 +120,22 @@ import Reactions from './Reactions.vue'
 // Lazy: htmldiff-js + motion-v only load when a viewer opens edit history.
 const RevisionsDialog = defineAsyncComponent(() => import('./RevisionsDialog.vue'))
 import UserAvatarWithHover from './UserAvatarWithHover.vue'
-import { GPComment } from '@/types/doctypes'
+import { GPBookmark, GPComment } from '@/types/doctypes'
 import { dialog } from 'frappe-ui'
 import { tags } from '@/data/tags'
 import { useDraftSync } from '@/data/useDraftSync'
 import { useUser, useSessionUser } from '@/data/users'
 import type { Space } from '@/data/spaces'
 import { canDeleteContent, canEditContent } from '@/utils/permissions'
+import { postedPollInContent } from '@/components/PollBlock/poll-draft'
+import { captureError } from '@/utils/errorReporting'
 
 interface Props {
   comment: GPComment
   readOnlyMode?: boolean
   highlight?: boolean
   comments: ReturnType<typeof useList<GPComment>>
+  bookmarks?: ReturnType<typeof useList<GPBookmark>>
   // Space the comment's thread belongs to, for community-admin delete moderation.
   space?: Space | null
 }
@@ -183,26 +183,53 @@ const updateComment = () => {
   const content = draftData.value?.content
   if (!content?.trim()) return
 
+  // Saving without the poll block deletes the poll and its votes, and a stray
+  // Backspace is enough to remove the block, so ask first.
+  const poll = postedPollInContent(props.comment.content)
+  if (poll && postedPollInContent(content) !== poll) {
+    dialog.danger({
+      title: 'Remove poll',
+      message: 'Saving this comment deletes its poll and all its votes. This cannot be undone.',
+      confirmLabel: 'Remove poll',
+      onConfirm: () => saveComment(content),
+    })
+    return
+  }
+  return saveComment(content)
+}
+
+const saveComment = async (content: string) => {
   isUpdating.value = true
   updateError.value = null
 
-  props.comments.setValue
-    .submit({
+  try {
+    await props.comments.setValue.submit({
       name: props.comment.name,
       content,
     })
-    .then(async () => {
-      await draft.commit()
-      isEditing.value = false
-      tags.reload()
-    })
-    .catch((error) => {
-      updateError.value = error
-    })
-    .finally(() => {
-      isUpdating.value = false
-    })
+    await draft.commit()
+    isEditing.value = false
+    tags.reload()
+  } catch (error) {
+    updateError.value = error
+  } finally {
+    isUpdating.value = false
+  }
 }
+
+const commentDoctype = useDoctype<GPComment>('GP Comment')
+
+const isBookmarked = computed(() =>
+  Boolean(props.bookmarks?.data?.some((b) => String(b.comment) === String(props.comment.name))),
+)
+
+const runBookmark = (method: 'add_bookmark' | 'remove_bookmark') =>
+  commentDoctype.runDocMethod
+    .submit({ name: props.comment.name, method })
+    .then(() => props.bookmarks?.reload())
+    .catch((error) =>
+      captureError(error, { action: method.replace('_', '-'), comment: props.comment.name }),
+    )
 
 const copyLink = (comment: GPComment) => {
   const location = window.location
@@ -216,6 +243,8 @@ const dropdownOptions = computed(() => [
     icon: 'lucide-edit',
     onClick: () => startEditing(),
     condition: () =>
+      !isEditing.value &&
+      !isUpdating.value &&
       !props.comment.deleted_at &&
       !props.readOnlyMode &&
       canEditContent(props.comment, props.space, useSessionUser()),
@@ -232,6 +261,18 @@ const dropdownOptions = computed(() => [
     onClick: () => copyLink(props.comment),
   },
   {
+    label: 'Bookmark',
+    icon: 'lucide-bookmark',
+    onClick: () => runBookmark('add_bookmark'),
+    condition: () => Boolean(props.bookmarks) && !isBookmarked.value && !props.comment.deleted_at,
+  },
+  {
+    label: 'Remove Bookmark',
+    icon: 'lucide-bookmark',
+    onClick: () => runBookmark('remove_bookmark'),
+    condition: () => isBookmarked.value,
+  },
+  {
     label: 'Delete',
     icon: 'lucide-trash',
     onClick: () => {
@@ -242,6 +283,8 @@ const dropdownOptions = computed(() => [
       })
     },
     condition: () =>
+      !isEditing.value &&
+      !isUpdating.value &&
       canDeleteContent(props.comment, props.space, useSessionUser()) &&
       props.comment.deleted_at == null &&
       !props.readOnlyMode,

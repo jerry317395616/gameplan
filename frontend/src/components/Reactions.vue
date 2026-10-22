@@ -4,15 +4,11 @@
     :toggleReaction="toggleReaction"
     :toolTipText="toolTipText"
     :standardEmojis="standardEmojis"
-    :isLoading="isLoading"
   />
-  <div class="mt-2 space-y-2" v-if="batchRequestErrors.length">
-    <ErrorMessage v-for="error in batchRequestErrors" :message="error" />
-  </div>
 </template>
-<script setup>
+<script setup lang="ts">
 import { defineAsyncComponent, computed } from 'vue'
-import { useReactions } from '@/data/reactions'
+import { useReactions, type ReactableDoctype } from '@/data/reactions'
 import { useIsMobile } from '@/utils/useIsMobile'
 
 const isMobileViewport = useIsMobile()
@@ -25,21 +21,15 @@ const ReactionsUI = computed(() => {
     return ReactionsDesktop
   }
 })
-const props = defineProps(['reactions', 'doctype', 'name', 'readOnlyMode'])
-const emit = defineEmits(['update:reactions'])
+const props = defineProps<{
+  doctype: ReactableDoctype
+  name: string | number
+  readOnlyMode?: boolean
+}>()
 
-const {
-  reactionsCount,
-  toggleReaction,
-  toolTipText,
-  standardEmojis,
-  batchRequestErrors,
-  isLoading,
-} = useReactions({
-  reactions: () => props.reactions,
+const { reactionsCount, toggleReaction, toolTipText, standardEmojis } = useReactions({
   doctype: () => props.doctype,
   name: () => props.name,
   readOnlyMode: () => props.readOnlyMode,
-  onUpdate: (reactions) => emit('update:reactions', reactions),
 })
 </script>

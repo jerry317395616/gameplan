@@ -2,7 +2,7 @@
   <div class="relative flex h-full flex-col" v-if="postId">
     <PageHeaderMobile class="sm:hidden" :title="mobileHeaderTitle">
       <template #prefix>
-        <PageHeaderBackButton :to="backRoute" />
+        <PageHeaderBackButton :fallback-route="backRoute" />
       </template>
     </PageHeaderMobile>
     <PageHeader class="hidden sm:flex">
@@ -11,7 +11,7 @@
         :spaceId="currentSpaceId"
         :items="[{ label: discussion.doc?.title || postId, onClick: scrollToTop }]"
       />
-      <span class="hidden text-lg-medium text-ink-gray-8 print:inline">
+      <span class="hidden text-md-medium text-ink-gray-8 print:inline">
         {{ [communityTitle, space?.title].filter(Boolean).join(' / ') }}
       </span>
     </PageHeader>
@@ -38,7 +38,7 @@
           </div>
         </div>
         <div class="flex items-start justify-between space-x-1">
-          <h1 class="flex items-center text-4xl-semibold animate-pulse">
+          <h1 class="flex items-center text-3xl-semibold animate-pulse">
             <span class="bg-surface-gray-3 h-5.5 w-32"> </span>
             <span class="bg-surface-gray-3 h-5.5 w-20 ml-2"> </span>
             <span class="bg-surface-gray-3 h-5.5 w-40 ml-2"> </span>
@@ -113,7 +113,7 @@
           </div>
           <div :class="{ 'pb-4 mt-1': !editingPost }">
             <div class="flex items-start justify-between space-x-1">
-              <h1 v-if="!editingPost" class="flex items-center text-4xl-semibold" ref="postTitleEl">
+              <h1 v-if="!editingPost" class="flex items-center text-3xl-semibold" ref="postTitleEl">
                 <Tooltip v-if="discussion.doc.closed_at" text="This discussion is closed">
                   <span class="lucide-lock mr-2 h-4 w-4 text-ink-gray-6" />
                 </Tooltip>
@@ -145,7 +145,7 @@
                 <input
                   v-if="editingPost"
                   type="text"
-                  class="w-full bg-transparent border-0 text-ink-gray-8 px-0 py-0.5 text-4xl-semibold focus:ring-0"
+                  class="w-full bg-transparent border-0 text-ink-gray-8 px-0 py-0.5 text-3xl-semibold focus:ring-0"
                   ref="title"
                   v-model="postTitle"
                   placeholder="Title"
@@ -180,7 +180,6 @@
             <Reactions
               doctype="GP Discussion"
               :name="discussion.doc.name"
-              v-model:reactions="discussion.doc.reactions"
               :read-only-mode="readOnlyMode"
             />
           </div>
@@ -271,6 +270,7 @@
                         pinDialog.show = false
                         pinDialog.pinToCategory = false
                       })
+                      .catch(() => {})
                   }
                 "
               >
@@ -287,7 +287,7 @@
         />
       </template>
       <EmptyStateBox v-else-if="notFound" class="mx-auto mt-14 max-w-2xl px-6">
-        <LucideTriangleAlert class="mb-3 size-7 text-ink-gray-4" />
+        <span class="lucide-triangle-alert mb-3 size-7 text-ink-gray-4" aria-hidden="true" />
         <div class="text-base text-ink-gray-7">Discussion not found</div>
         <p class="mt-2 max-w-md text-center text-p-sm text-ink-gray-5">
           This discussion may have been deleted, or you no longer have access to it. Refresh to try
@@ -299,7 +299,7 @@
            pre-fetch tick (useFetch defers its first execute by a microtask) doesn't flash
            an error. -->
       <EmptyStateBox v-else-if="discussion.isFinished" class="mx-auto mt-14 max-w-2xl px-6">
-        <LucideTriangleAlert class="mb-3 size-7 text-ink-gray-4" />
+        <span class="lucide-triangle-alert mb-3 size-7 text-ink-gray-4" aria-hidden="true" />
         <div class="text-base text-ink-gray-7">Could not load this discussion</div>
         <p class="mt-2 max-w-md text-center text-p-sm text-ink-gray-5">
           Something went wrong while loading it. Refresh to try again.
@@ -350,6 +350,7 @@ import {
   dayjsLocal,
   Switch,
   dialog,
+  toast,
 } from 'frappe-ui'
 import { until, useEventListener } from '@vueuse/core'
 import type { Editor } from '@tiptap/vue-3'
@@ -367,6 +368,7 @@ import { getSpace, useSpace } from '@/data/spaces'
 import { useCommunity } from '@/data/communities'
 import { useGroupedSpaceOptions } from '@/data/groupedSpaces'
 import { useDiscussion } from '@/data/discussions'
+import { provideThreadReactions } from '@/data/reactions'
 import { useDraftSync } from '@/data/useDraftSync'
 import { tags } from '@/data/tags'
 import { shellScrollContainer, useShellScrolled } from 'frappe-ui'
@@ -376,6 +378,7 @@ import QuoteBacklinksPopover from '@/components/RichQuoteExtension/QuoteBacklink
 import { refreshUnreadCountForProjects } from '@/data/unreadCount'
 import { useSessionUser } from '@/data/users'
 import { canDeleteContent, canEditContent, canMoveOrPinContent } from '@/utils/permissions'
+import { captureError } from '@/utils/errorReporting'
 import { useCommandPaletteCommands } from './CommandPalette/registry'
 import { useOwnedRouteWrites } from '@/composables/useOwnedRouteWrites'
 
@@ -448,7 +451,7 @@ useEventListener(window, 'resize', scheduleScrollToTopPlacement)
 function scrollToTop() {
   shellScrollContainer.value?.scrollTo({ top: 0, behavior: 'smooth' })
 }
-const discussion = useDiscussion(() => props.postId)
+const discussion = useDiscussion(props.postId)
 // In-app navigation skips the router's server canonicalization for speed, so a stale link to a
 // discussion deleted or moved out of reach after local data loaded would otherwise render a blank
 // detail view. Show a not-found state in place (keeping the URL) rather than redirecting to the
@@ -470,6 +473,7 @@ const mobileHeaderTitle = computed(() =>
   showTitleInMobileHeader.value ? discussion.doc?.title || 'Discussion' : 'Discussion',
 )
 
+provideThreadReactions('GP Discussion', props.postId)
 const richQuotes = provideRichQuotes()
 richQuotes.setPostContentEl(() => mainPostContentEl.value)
 
@@ -617,9 +621,12 @@ async function scrollToUnread() {
   }
 
   if (route.name === 'Discussion' && route.params.postId === doc?.name) {
-    discussion.trackVisit.submit().then(() => {
-      refreshUnreadCountForProjects([doc.project])
-    })
+    discussion.trackVisit
+      .submit()
+      .then(() => {
+        refreshUnreadCountForProjects([doc.project])
+      })
+      .catch(() => {})
   }
 }
 
@@ -753,7 +760,6 @@ function cancelEdit() {
 function updatePost() {
   if (!editingPost.value || !canSavePost.value) return
   // Show the new title at once instead of the old one until the server answers.
-  // A failed save resolves null, so put the old title back, unless something newer replaced it.
   const title = postDraftData.value?.title
   const previousTitle = discussion.doc?.title
   if (discussion.doc && title) discussion.doc.title = title
@@ -762,15 +768,19 @@ function updatePost() {
       title,
       content: postDraftData.value?.content,
     })
-    .then(async (response) => {
-      const doc = discussion.doc
-      if (!response && doc && doc.title === title && previousTitle !== undefined) {
-        doc.title = previousTitle
-      }
-      // Content is saved onto the post; migrate the draft's attachments and delete it.
-      await postDraft.commit()
-      tags.reload()
-    })
+    .then(
+      async () => {
+        // Content is saved onto the post; migrate the draft's attachments and delete it.
+        await postDraft.commit()
+        tags.reload()
+      },
+      () => {
+        // The save failed: put the old title back, unless something newer replaced it.
+        const doc = discussion.doc
+        if (doc && doc.title === title && previousTitle !== undefined) doc.title = previousTitle
+        toast.error('Could not save the discussion')
+      },
+    )
   editingPost.value = false
   editSnapshot.value = null
 }
@@ -870,17 +880,25 @@ const actions = computed(() => [
     label: 'Mark as unread',
     icon: 'lucide-mail',
     onClick: () => {
-      discussion.markAsUnread.submit().then(() => {
-        if (discussion.doc?.project) {
-          refreshUnreadCountForProjects([discussion.doc.project])
-        }
-      })
+      discussion.markAsUnread
+        .submit()
+        .then(() => {
+          if (discussion.doc?.project) {
+            refreshUnreadCountForProjects([discussion.doc.project])
+          }
+        })
+        .catch(() => {})
     },
   },
   {
     label: 'Bookmark',
     icon: 'lucide-bookmark',
-    onClick: () => discussion.addBookmark.submit(),
+    onClick: () =>
+      discussion.addBookmark
+        .submit()
+        .catch((error) =>
+          captureError(error, { action: 'add-bookmark', discussion: props.postId }),
+        ),
     condition: () => !discussion.doc?.is_bookmarked,
   },
   {
@@ -943,7 +961,12 @@ const actions = computed(() => [
   {
     label: 'Remove Bookmark',
     icon: 'lucide-bookmark',
-    onClick: () => discussion.removeBookmark.submit(),
+    onClick: () =>
+      discussion.removeBookmark
+        .submit()
+        .catch((error) =>
+          captureError(error, { action: 'remove-bookmark', discussion: props.postId }),
+        ),
     condition: () => discussion.doc?.is_bookmarked,
   },
   {

@@ -2,9 +2,18 @@
 # For license information, please see license.txt
 
 import re
+from datetime import datetime
 
 import frappe
+from frappe import _
 from frappe.model.document import Document
+from frappe.utils import get_datetime, now_datetime
+
+from gameplan.utils.document import with_stored_document
+
+# Edit drafts finish on the post or comment they edit; new-comment drafts finish on the
+# discussion or task they reply to.
+COMMIT_TARGET_DOCTYPES = ("GP Discussion", "GP Task", "GP Comment")
 
 
 class GPDraft(Document):
@@ -19,10 +28,39 @@ class GPDraft(Document):
 		query = query.where(GPDraft.owner == frappe.session.user)
 		return query
 
-	@frappe.whitelist(methods=["POST"])
-	def publish(self):
+	def require_owner(self, action="modify"):
 		if self.owner != frappe.session.user:
-			frappe.throw("You are not allowed to publish this draft")
+			frappe.throw(_("You are not allowed to {0} this draft").format(action))
+
+	@frappe.whitelist(methods=["POST"])
+	@with_stored_document
+	def schedule(self, scheduled_at):
+		"""Publish this discussion draft later. The row stays a draft — still editable, still
+		auto-saved — with a time on it; `publish_due_drafts` turns it into a discussion at
+		that minute, as this user."""
+		self.require_owner("schedule")
+		if self.type != "Discussion":
+			frappe.throw(_("Only discussion drafts can be scheduled"))
+		if not self.title or not self.project:
+			frappe.throw(_("Add a title and pick a Space before scheduling"))
+		scheduled_at = get_datetime(scheduled_at)
+		if scheduled_at <= now_datetime():
+			frappe.throw(_("Pick a time in the future"))
+		self.scheduled_at = scheduled_at
+		self.save()
+		return self.scheduled_at
+
+	@frappe.whitelist(methods=["POST"])
+	@with_stored_document
+	def unschedule(self):
+		self.require_owner("schedule")
+		self.scheduled_at = None
+		self.save()
+
+	@frappe.whitelist(methods=["POST"])
+	@with_stored_document
+	def publish(self):
+		self.require_owner("publish")
 
 		if self.type == "Discussion":
 			content = remove_query_params_from_images(self.content)
@@ -42,10 +80,12 @@ class GPDraft(Document):
 		target document. Reparents any draft-owned attachments onto the target (so they
 		survive the draft deletion) and clears the ?fid= query params that otherwise hide
 		the migrated images, then deletes the draft."""
-		if self.owner != frappe.session.user:
-			frappe.throw("You are not allowed to modify this draft")
+		self.require_owner("commit")
+		if reference_doctype not in COMMIT_TARGET_DOCTYPES:
+			frappe.throw(_("Drafts cannot be committed to {0}").format(reference_doctype))
 
 		target = frappe.get_doc(reference_doctype, reference_name)
+		target.check_permission("write")
 		self.move_attachments_to(target)
 
 		cleaned = remove_query_params_from_images(target.content or "")
@@ -136,6 +176,7 @@ def get_my_drafts():
 			"reference_name",
 			"creation",
 			"modified",
+			"scheduled_at",
 		],
 		order_by="modified desc",
 		ignore_permissions=False,
@@ -211,6 +252,7 @@ def get_my_drafts():
 					"community": project.team if project else None,
 					"is_private": project.is_private if project else 0,
 					"discussion": None,
+					"scheduled_at": r.scheduled_at,
 				}
 			)
 		elif r.type == "Comment" and r.reference_doctype == "GP Discussion":
@@ -244,6 +286,48 @@ def get_my_drafts():
 def publish_draft(name: str):
 	"""Publish a discussion draft by name. Returns the new GP Discussion name."""
 	return frappe.get_doc("GP Draft", name).publish()
+
+
+@frappe.whitelist(methods=["POST"])
+def schedule_draft(name: str, scheduled_at: str | datetime):
+	"""Schedule a discussion draft for `scheduled_at` (site time). Returns the stored time."""
+	return frappe.get_doc("GP Draft", name).schedule(scheduled_at)
+
+
+@frappe.whitelist(methods=["POST"])
+def unschedule_draft(name: str):
+	frappe.get_doc("GP Draft", name).unschedule()
+
+
+def publish_due_drafts():
+	"""Scheduler entry (every tick, so to the minute): publish every draft whose time has
+	come, each as its own author, so the discussion is theirs and their permissions decide.
+	A draft that cannot be published — space archived, access gone — keeps its content, loses
+	its time and shows up in the author's Drafts again, with the reason in the Error Log."""
+	due = frappe.get_all(
+		"GP Draft",
+		filters=[
+			["type", "=", "Discussion"],
+			["scheduled_at", "is", "set"],
+			["scheduled_at", "<=", now_datetime()],
+		],
+		fields=["name", "owner"],
+		order_by="scheduled_at asc",
+	)
+	for row in due:
+		frappe.set_user(row.owner)
+		frappe.db.savepoint("scheduled_draft")
+		try:
+			scheduled_at = frappe.db.get_value("GP Draft", row.name, "scheduled_at", for_update=True)
+			if not scheduled_at or get_datetime(scheduled_at) > now_datetime():
+				continue
+			frappe.get_doc("GP Draft", row.name).publish()
+		except Exception:
+			frappe.db.rollback(save_point="scheduled_draft")
+			frappe.log_error(title=f"Scheduled draft {row.name} could not be published")
+			frappe.db.set_value("GP Draft", row.name, "scheduled_at", None, update_modified=False)
+		finally:
+			frappe.set_user("Administrator")
 
 
 @frappe.whitelist(methods=["POST"])

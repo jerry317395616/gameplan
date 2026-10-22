@@ -9,7 +9,6 @@
       <template #trigger>
         <button
           aria-label="Add a reaction"
-          :disabled="isLoading"
           class="flex h-full items-center justify-center rounded-full bg-surface-gray-2 px-2 py-1 text-ink-gray-6 transition hover:bg-surface-gray-3 print:hidden"
           :class="{ 'bg-surface-gray-3': isPickerOpen }"
           @click="isPickerOpen = true"
@@ -25,12 +24,11 @@
             variant="ghost"
             size="xs"
             class="font-[emoji]"
-            :disabled="isLoading"
             @click="selectEmoji(emoji)"
           >
             <template #icon>
               <img v-if="isImageEmoji(emoji)" :src="emoji" alt="" class="size-4 object-contain" />
-              <span v-else class="text-lg">
+              <span v-else class="text-md">
                 {{ emoji }}
               </span>
             </template>
@@ -68,13 +66,13 @@
 import { ref } from 'vue'
 import { Button, HoverCard, Tooltip, TooltipProvider } from 'frappe-ui'
 import { isImageEmoji } from '@/utils/emoji'
+import type { ReactionCount } from '@/data/reactions'
 
 const props = defineProps<{
-  reactionsCount: Record<string, { count: number; userReacted: boolean }>
+  reactionsCount: Record<string, ReactionCount>
   toggleReaction: (emoji: string) => void
-  toolTipText: (reactions: { count: number; userReacted: boolean }) => string
+  toolTipText: (reactions: ReactionCount) => string
   standardEmojis: string[]
-  isLoading: boolean
 }>()
 
 const isPickerOpen = ref(false)

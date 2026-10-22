@@ -4,19 +4,18 @@
       <Button v-if="isBulkDeleteMode" variant="ghost" size="md" @click="cancelBulkDelete">
         Cancel
       </Button>
-      <PageHeaderBackButton v-else :to="{ name: 'More' }" />
+      <PageHeaderBackButton v-else :fallback-route="{ name: 'More' }" />
     </template>
     <template #suffix>
       <div class="flex items-center gap-2">
         <template v-if="!isBulkDeleteMode">
-          <Button
-            v-show="drafts.data?.length"
-            variant="ghost"
-            size="md"
-            @click="isBulkDeleteMode = true"
-          >
-            Select
-          </Button>
+          <DropdownMoreOptions
+            v-if="drafts.data?.length"
+            label="Draft actions"
+            button-size="md"
+            align="end"
+            :options="draftActions"
+          />
           <Button
             v-if="!readOnlyMode"
             variant="subtle"
@@ -43,14 +42,12 @@
     <Breadcrumbs class="h-7" :items="[{ label: 'Drafts', route: { name: 'Drafts' } }]" />
     <div class="flex items-center gap-2">
       <template v-if="!isBulkDeleteMode">
-        <Button
-          v-show="drafts.data?.length"
-          variant="ghost"
-          icon-left="lucide-square-check"
-          @click="isBulkDeleteMode = true"
-        >
-          Select
-        </Button>
+        <DropdownMoreOptions
+          v-if="drafts.data?.length"
+          label="Draft actions"
+          align="end"
+          :options="draftActions"
+        />
         <Button
           v-if="!readOnlyMode"
           variant="subtle"
@@ -89,7 +86,7 @@
           <ListRow
             v-for="draft in drafts.data"
             :key="draft.name"
-            :to="draftRoute(draft)"
+            :route="draftRoute(draft)"
             :value="draft.name"
             class="h-15"
           >
@@ -107,6 +104,14 @@
                   >
                     {{ draft.title }}
                   </span>
+                  <Tooltip
+                    v-if="draft.scheduled_at"
+                    :text="`Scheduled for ${dayjsLocal(draft.scheduled_at).format(
+                      'ddd D MMM, h:mm A',
+                    )}`"
+                  >
+                    <span class="lucide-calendar-clock size-4 shrink-0 text-ink-gray-5" />
+                  </Tooltip>
                 </div>
                 <div class="flex mt-1.5 items-center min-w-0">
                   <div
@@ -170,7 +175,9 @@ import {
   toast,
 } from 'frappe-ui'
 import { List, ListRow, ListCell } from 'frappe-ui/list'
+import EmptyStateBox from '@/components/EmptyStateBox.vue'
 import UserAvatarWithHover from '@/components/UserAvatarWithHover.vue'
+import DropdownMoreOptions from '@/components/DropdownMoreOptions.vue'
 import NewDiscussionSpaceDialog from '@/components/NewDiscussionSpaceDialog.vue'
 import { readOnlyMode } from '@/data/readOnlyMode'
 import { relativeTimestamp } from '@/utils'
@@ -191,6 +198,14 @@ const isBulkDeleteMode = ref(false)
 const selectedDrafts = ref<string[]>([])
 const showDeleteConfirm = ref(false)
 const showNewDiscussionDialog = ref(false)
+
+const draftActions = [
+  {
+    label: 'Select drafts',
+    icon: 'lucide-square-check',
+    onClick: () => (isBulkDeleteMode.value = true),
+  },
+]
 
 // Comment drafts always open their parent discussion with the reply composer focused
 // (?draft=comment) — never the new-discussion composer, which would resurface a saved reply

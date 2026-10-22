@@ -4,7 +4,6 @@
       <Motion
         as="button"
         aria-label="Add a reaction"
-        :disabled="isLoading"
         @click="show = true"
         class="flex h-full items-center justify-center rounded-full bg-surface-gray-2 px-2 py-1 text-ink-gray-6 transition hover:bg-surface-gray-3"
         :whileTap="{ scale: 0.95 }"
@@ -46,7 +45,6 @@
                 : 'bg-surface-sidebar hover:bg-surface-gray-2',
             ]"
             @click="toggleReaction(emoji)"
-            :disabled="isLoading"
             :whileTap="{ scale: 0.9 }"
             :whileHover="{ scale: 1.05 }"
             :whilePress="{ scale: 1.05 }"
@@ -57,7 +55,7 @@
               alt=""
               class="mx-auto size-6 object-contain"
             />
-            <span v-else class="font-[emoji] text-4xl">
+            <span v-else class="font-[emoji] text-3xl">
               {{ emoji }}
             </span>
           </Motion>
@@ -76,10 +74,10 @@
           >
             <div class="mr-2 flex w-14 items-center justify-center gap-1 text-center">
               <img v-if="isImageEmoji(emoji)" :src="emoji" alt="" class="size-6 object-contain" />
-              <span v-else class="text-4xl font-[emoji]"> {{ emoji }}</span>
-              <span class="text-p-xl text-ink-gray-4"> ({{ reactions.count }}) </span>
+              <span v-else class="text-3xl font-[emoji]"> {{ emoji }}</span>
+              <span class="text-p-lg text-ink-gray-4"> ({{ reactions.count }}) </span>
             </div>
-            <span class="text-p-xl flex-1 text-ink-gray-6">
+            <span class="text-p-lg flex-1 text-ink-gray-6">
               {{ toolTipText(reactions) }}
             </span>
           </Motion>
@@ -94,12 +92,12 @@ import { AnimatePresence, Motion } from 'motion-v'
 import ReactionFaceIcon from './ReactionFaceIcon.vue'
 import { BottomSheet } from 'frappe-ui'
 import { isImageEmoji } from '@/utils/emoji'
+import type { ReactionCount } from '@/data/reactions'
 const props = defineProps<{
-  reactionsCount: Record<string, { count: number; userReacted: boolean }>
+  reactionsCount: Record<string, ReactionCount>
   toggleReaction: (emoji: string) => void
-  toolTipText: (reactions: { count: number; userReacted: boolean }) => string
+  toolTipText: (reactions: ReactionCount) => string
   standardEmojis: string[]
-  isLoading: boolean
 }>()
 
 let show = ref(false)

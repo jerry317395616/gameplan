@@ -3,7 +3,10 @@
 
 """Draft behaviour: the one-draft-per-target rule and self-healing on read."""
 
+from unittest.mock import patch
+
 import frappe
+from frappe.utils import add_to_date, get_datetime, now_datetime
 
 from gameplan.gameplan.doctype.gp_draft.gp_draft import (
 	GPDraft,
@@ -11,6 +14,9 @@ from gameplan.gameplan.doctype.gp_draft.gp_draft import (
 	find_my_draft,
 	get_my_drafts,
 	publish_draft,
+	publish_due_drafts,
+	schedule_draft,
+	unschedule_draft,
 )
 from gameplan.tests.base import GameplanTestCase
 from gameplan.tests.fixtures import (
@@ -19,6 +25,7 @@ from gameplan.tests.fixtures import (
 	create_discussion,
 	create_member,
 	create_space,
+	grant_guest_access,
 	set_owner,
 )
 
@@ -274,6 +281,54 @@ class TestDraftCommit(GameplanTestCase):
 
 		self.assertTrue(frappe.db.exists("GP Draft", draft.name))
 
+	def _reply_draft_with_attachment(self, user, discussion):
+		with self.as_user(user):
+			draft = _insert_draft(
+				type="Comment",
+				mode="New",
+				reference_doctype="GP Discussion",
+				reference_name=str(discussion.name),
+				content="<p>a reply</p>",
+			)
+		attachment = frappe.get_doc(
+			doctype="File",
+			file_name="draft-commit-attachment.txt",
+			is_private=1,
+			content=b"attachment",
+			attached_to_doctype="GP Draft",
+			attached_to_name=draft.name,
+		).insert(ignore_permissions=True)
+		return draft, attachment
+
+	def _attached_to(self, attachment):
+		return frappe.db.get_value("File", attachment.name, ["attached_to_doctype", "attached_to_name"])
+
+	def test_a_guest_reply_draft_moves_its_attachments_onto_the_discussion(self):
+		grant_guest_access(self.guest, self.space)
+		draft, attachment = self._reply_draft_with_attachment(self.guest, self.discussion)
+
+		with self.as_user(self.guest):
+			commit_draft(draft.name, "GP Discussion", str(self.discussion.name))
+
+		self.assertEqual(self._attached_to(attachment), ("GP Discussion", str(self.discussion.name)))
+		self.assertFalse(frappe.db.exists("GP Draft", draft.name))
+
+	def test_a_draft_commits_only_onto_content_its_owner_can_write(self):
+		private_space = create_space(
+			"Draft Commit Private Space", self.community, is_private=1, members=[self.member]
+		)
+		private_discussion = create_discussion("Draft Commit Private", private_space, owner=self.member)
+		draft, attachment = self._reply_draft_with_attachment(self.outsider, self.discussion)
+
+		with self.as_user(self.outsider):
+			with self.assertRaises(frappe.PermissionError):
+				commit_draft(draft.name, "GP Discussion", str(private_discussion.name))
+			with self.assertRaises(frappe.ValidationError):
+				commit_draft(draft.name, "User", self.member.name)
+
+		self.assertEqual(self._attached_to(attachment), ("GP Draft", draft.name))
+		self.assertTrue(frappe.db.exists("GP Draft", draft.name))
+
 
 class TestFindMyDraft(GameplanTestCase):
 	def test_find_my_draft_resolves_a_draft_that_has_no_reference(self):
@@ -402,3 +457,124 @@ class TestMyDrafts(GameplanTestCase):
 
 		self.assertEqual([row["name"] for row in drafts], [newer.name])
 		self.assertTrue(frappe.db.exists("GP Draft", older.name))
+
+
+class TestScheduledDrafts(GameplanTestCase):
+	"""A scheduled post is a discussion draft with a time on it; `publish_due_drafts` turns
+	it into a discussion, as its author, once that time has passed."""
+
+	def setUp(self):
+		super().setUp()
+		self.community = create_community("Schedule Community", members=[self.member])
+		self.space = create_space("Schedule Space", self.community)
+		with self.as_user(self.member):
+			self.draft = _insert_draft(
+				type="Discussion",
+				mode="New",
+				title="Later",
+				content="<p>later body</p>",
+				project=self.space.name,
+			)
+
+	def test_the_owner_can_schedule_a_future_time(self):
+		later = add_to_date(now_datetime(), hours=1)
+		with self.as_user(self.member):
+			schedule_draft(self.draft.name, later)
+		self.assertEqual(
+			get_datetime(frappe.db.get_value("GP Draft", self.draft.name, "scheduled_at")).replace(
+				microsecond=0
+			),
+			later.replace(microsecond=0),
+		)
+
+	def test_a_past_time_is_refused(self):
+		with self.as_user(self.member), self.assertRaises(frappe.ValidationError):
+			schedule_draft(self.draft.name, add_to_date(now_datetime(), minutes=-1))
+
+	def test_a_draft_without_a_title_or_space_cannot_be_scheduled(self):
+		with self.as_user(self.member):
+			bare = _insert_draft(type="Discussion", mode="New", content="<p>x</p>")
+			with self.assertRaises(frappe.ValidationError):
+				schedule_draft(bare.name, add_to_date(now_datetime(), hours=1))
+
+	def test_only_the_owner_can_schedule(self):
+		with self.as_user(self.second_member), self.assertRaises(frappe.ValidationError):
+			schedule_draft(self.draft.name, add_to_date(now_datetime(), hours=1))
+
+	def test_unschedule_clears_the_time(self):
+		with self.as_user(self.member):
+			schedule_draft(self.draft.name, add_to_date(now_datetime(), hours=1))
+			unschedule_draft(self.draft.name)
+		self.assertIsNone(frappe.db.get_value("GP Draft", self.draft.name, "scheduled_at"))
+
+	def test_an_unscheduled_draft_is_never_touched(self):
+		publish_due_drafts()
+		self.assertTrue(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertFalse(frappe.db.exists("GP Discussion", {"title": "Later"}))
+
+	def test_nothing_happens_before_the_time(self):
+		with self.as_user(self.member):
+			schedule_draft(self.draft.name, add_to_date(now_datetime(), hours=1))
+		publish_due_drafts()
+		self.assertTrue(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertFalse(frappe.db.exists("GP Discussion", {"title": "Later"}))
+
+	def test_a_due_draft_is_published_as_its_author(self):
+		frappe.db.set_value(
+			"GP Draft", self.draft.name, "scheduled_at", add_to_date(now_datetime(), minutes=-1)
+		)
+		publish_due_drafts()
+		discussion = frappe.get_doc("GP Discussion", {"title": "Later"})
+		self.assertEqual(discussion.owner, self.member.name)
+		self.assertEqual(str(discussion.project), str(self.space.name))
+		self.assertIn("later body", discussion.content)
+		self.assertFalse(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def test_a_draft_that_cannot_be_published_keeps_its_content_and_loses_its_time(self):
+		frappe.db.set_value(
+			"GP Draft", self.draft.name, "scheduled_at", add_to_date(now_datetime(), minutes=-1)
+		)
+		self.space.reload()
+		self.space.members = []
+		self.space.is_private = 1
+		self.space.save(ignore_permissions=True)
+		with patch("frappe.log_error") as log_error:
+			publish_due_drafts()
+		self.assertTrue(
+			any("could not be published" in str(c.kwargs.get("title", "")) for c in log_error.call_args_list)
+		)
+		self.assertTrue(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertIsNone(frappe.db.get_value("GP Draft", self.draft.name, "scheduled_at"))
+		self.assertFalse(frappe.db.exists("GP Discussion", {"title": "Later"}))
+		self.assertEqual(frappe.session.user, "Administrator")
+
+	def _publish_with_stale_due_row(self):
+		stale = [frappe._dict(name=self.draft.name, owner=self.member.name)]
+		with patch("gameplan.gameplan.doctype.gp_draft.gp_draft.frappe.get_all", return_value=stale):
+			publish_due_drafts()
+
+	def test_a_draft_unscheduled_after_the_due_query_is_not_published(self):
+		self._publish_with_stale_due_row()
+		self.assertTrue(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertFalse(frappe.db.exists("GP Discussion", {"title": "Later"}))
+
+	def test_a_draft_rescheduled_after_the_due_query_is_not_published(self):
+		later = add_to_date(now_datetime(), hours=1)
+		frappe.db.set_value("GP Draft", self.draft.name, "scheduled_at", later)
+		self._publish_with_stale_due_row()
+		self.assertTrue(frappe.db.exists("GP Draft", self.draft.name))
+		self.assertFalse(frappe.db.exists("GP Discussion", {"title": "Later"}))
+		self.assertEqual(
+			get_datetime(frappe.db.get_value("GP Draft", self.draft.name, "scheduled_at")).replace(
+				microsecond=0
+			),
+			later.replace(microsecond=0),
+		)
+
+	def test_my_drafts_carries_the_time(self):
+		later = add_to_date(now_datetime(), hours=1)
+		with self.as_user(self.member):
+			schedule_draft(self.draft.name, later)
+			row = next(d for d in get_my_drafts() if d["name"] == self.draft.name)
+		self.assertIsNotNone(row["scheduled_at"])
